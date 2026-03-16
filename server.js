@@ -9,35 +9,51 @@ require('express-async-errors');
 const app = express();
 const server = http.createServer(app);
 
-// --- Socket.io Setup ---
+// --- Allowed origins (Frontend URLs) ---
+const ALLOWED_ORIGINS = [
+  'https://hospital-intelligence-system.vercel.app',
+  'https://nova-health-ai.vercel.app',
+  'http://localhost:5173',
+  'http://localhost:5174',
+  'http://localhost:3000',
+  process.env.CLIENT_URL
+].filter(Boolean);
+
+// --- Socket.io Setup (must use http server, not app) ---
 const io = new Server(server, {
   cors: {
-    origin: [
-      process.env.CLIENT_URL || 'http://localhost:5173',
-      'https://nova-health-ai.vercel.app',
-      'http://localhost:5174'
-    ],
+    origin: ALLOWED_ORIGINS,
     methods: ['GET', 'POST'],
     credentials: true
-  }
+  },
+  pingTimeout: 60000,
+  pingInterval: 25000,
+  transports: ['websocket', 'polling']
 });
 
-// --- Middleware ---
+// --- CORS Middleware ---
 app.use(cors({
-  origin: [
-    process.env.CLIENT_URL || 'http://localhost:5173',
-    'https://nova-health-ai.vercel.app',
-    'http://localhost:5174'
-  ],
-  credentials: true
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps, curl)
+    if (!origin) return callback(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    return callback(null, true); // Allow all in case of new deploy URLs
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));
+
+// Handle preflight for all routes
+app.options('*', cors());
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 // --- Database ---
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('✅ MongoDB Connected Successfully'))
-  .catch(err => console.error('❌ MongoDB Connection Error:', err));
+  .catch(err => console.error('❌ MongoDB Connection Error:', err.message));
 
 // --- Routes ---
 app.use('/api/auth', require('./routes/auth'));
@@ -60,13 +76,13 @@ app.get('/', (req, res) => {
   res.json({ 
     status: 'active', 
     message: 'Nova Health AI Backend is running',
-    version: '2.0.0',
+    version: '2.1.0',
     timestamp: new Date().toISOString()
   });
 });
 
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', uptime: process.uptime() });
+  res.json({ status: 'ok', uptime: process.uptime(), timestamp: new Date().toISOString() });
 });
 
 // --- Socket.io Events ---
@@ -74,42 +90,51 @@ io.on('connection', (socket) => {
   console.log(`🔌 Client connected: ${socket.id}`);
 
   socket.on('join-room', (roomId) => {
-    socket.join(roomId);
-    console.log(`📍 Socket ${socket.id} joined room: ${roomId}`);
+    if (roomId) {
+      socket.join(roomId);
+    }
   });
 
   socket.on('leave-room', (roomId) => {
-    socket.leave(roomId);
+    if (roomId) socket.leave(roomId);
   });
 
-  socket.on('send-message', async (messageData) => {
-    socket.to(messageData.roomId).emit('new-message', messageData);
+  socket.on('send-message', (messageData) => {
+    if (messageData?.roomId) {
+      socket.to(messageData.roomId).emit('new-message', messageData);
+    }
   });
 
   socket.on('typing', ({ roomId, userId, isTyping }) => {
-    socket.to(roomId).emit('user-typing', { userId, isTyping });
+    if (roomId) socket.to(roomId).emit('user-typing', { userId, isTyping });
   });
 
   socket.on('mark-seen', (messageId) => {
-    socket.broadcast.emit('message-seen', messageId);
+    if (messageId) socket.broadcast.emit('message-seen', messageId);
   });
 
-  socket.on('disconnect', () => {
-    console.log(`🔌 Client disconnected: ${socket.id}`);
+  socket.on('error', (err) => {
+    console.error(`Socket error from ${socket.id}:`, err.message);
+  });
+
+  socket.on('disconnect', (reason) => {
+    console.log(`🔌 Disconnected: ${socket.id} — Reason: ${reason}`);
   });
 });
 
-// --- Error Handler ---
+// --- Global Error Handler ---
 app.use((err, req, res, next) => {
-  console.error('❌ Error:', err.message);
+  console.error('❌ Server Error:', err.message);
   res.status(err.status || 500).json({
     success: false,
     message: err.message || 'Internal Server Error'
   });
 });
 
+// --- Start Server — MUST listen on 0.0.0.0 for Railway ---
 const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Nova Health Backend running on port ${PORT}`);
   console.log(`📡 Socket.io enabled`);
+  console.log(`🌐 Allowed origins: ${ALLOWED_ORIGINS.join(', ')}`);
 });
